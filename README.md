@@ -4,11 +4,16 @@ Reproduction harness for the PHP "php2shell" remote code execution
 vulnerability, CVE-2026-109618 and CVE-2026-109619, fixed in PHP 8.5.12 /
 8.4.27 / 8.3.36 / 8.2.35.
 
-> **Lab only.** Every chain here targets the *vulnerable* `php:8.5.11` Docker
-> images. The patched releases are the control in every test. Run this only
-> against containers you own or are explicitly authorized to test. It is kept
-> for defensive understanding and research, not for use against systems you do
-> not control.
+> **Lab only, educational use.** Every chain here targets the *vulnerable*
+> `php:8.5.11` Docker images. The patched releases are the control in every
+> test. This exists for defensive understanding and research. Run it only
+> against containers you own or are explicitly authorized to test, never
+> against systems you do not control.
+>
+> **Never run code blindly.** Read every script and payload in this repository,
+> and understand what it does, before you execute it. That holds for any code
+> you find online, and doubly so for code whose whole purpose is to corrupt
+> memory.
 
 ## What this is
 
