@@ -1,0 +1,7 @@
+{
+    "require": {
+        "illuminate/broadcasting": "^13.38",
+        "illuminate/events": "^13.38",
+        "league/commonmark": "^2.10"
+    }
+}
