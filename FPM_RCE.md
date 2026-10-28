@@ -149,7 +149,7 @@ The frame at `d+0xE00`:
 ## 6. Reproduction
 
 ```bash
-cd ~/ai/php/php2shell_mod_php
+cd ~/php2shell
 bash fpm/run_rce_fpm.sh          # MODE=nogdb: setarch -R php-fpm -F
 MODE=gdb bash fpm/run_rce_fpm.sh # same chain under the tracing probe
 ```
@@ -242,3 +242,141 @@ session decode:
 
 The old E1 six-value option-2 layout is superseded: its encoder iterates 7/8
 buckets while the fake table has five, and dies in `zend_hash_find`.
+
+## 10. Data-only variant (no forged execute_data)
+
+`ROP_PIVOT.md` §"FPM data-only pivot" documents a second working FPM chain that
+replaces the forged `zend_execute_data` + `zif_system` with a `jump_fcontext`
+stack pivot and a `popen` ROP chain. It reuses this chain's leak and
+E0/E2/fake-table mechanism verbatim; only the fire point and the bucket-0
+contents differ. Instead of the teardown destroy (which fires on the
+progress-clobbered bucket 0 and so cannot carry the pivot), it forges the
+`upload_progress_x` key at bucket 0 and lets the upload-progress
+`zend_hash_update` old-value destructor fire the pivot on the clean buffer
+before the insert overwrites it. `bash fpm/run_rop_pivot.sh` → `uid=33`, 7/7,
+ASLR on, no gdb.
+
+## 11. Stock-config reachability (128M)
+
+Verdict per genericity prop, on `php:8.5.11-fpm` with stock `php.ini-production`
+(`memory_limit=128M`, `session.upload_progress.enabled=On`, no `ini_set` memory
+override), single worker, `session.save_path` empty (resolves to `/tmp`):
+
+| prop | verdict | basis |
+|---|---|---|
+| (1) decode-time longjmp OOM bailout | **reachable** | OOM backtrace + `BG(unserialize)` scan |
+| dangling-`d` reuse across the A/B pair | **reachable** | B pre-RINIT decode reuses A's `d`, `level 1->2` |
+| (2) attacker bytes into `$_SESSION` | **not on stock** | upload-progress writes a fixed-shape array only |
+| groom reclaim / fill offsets (prop 3) | **partial** | reuse + reclaim fire; 4M-tuned `fillU.bin` misaligns |
+
+Harness: container `p2s-fpm-stock`, page `www/stock_sess.php` (bare
+`session_start()`, no memory override), groom builder `fpm/mk_a_amp.py`,
+probes `fpm/probe-stock-oom.gdb` (OOM backtrace + BG state) and
+`fpm/probe-trace.gdb` (per-decode `init`/`destroy` with `d`/`level`).
+
+### Prop (1): the 4M `ini_set` is not fundamental, only a file-size reducer
+
+`memory_limit` sets the OOM threshold; the bailout mechanism is identical at any
+limit. The array handler in `ext/standard/var_unserializer.re` (8.5.11) sizes
+the bucket block up front with the **bailing** allocator:
+
+```
+array_init_size(rval, elements);
+zend_hash_real_init_mixed(Z_ARRVAL_P(rval));   /* emalloc, longjmp on OOM */
+```
+
+`zend_hash_real_init_mixed()` allocates `next_pow2(N) * sizeof(Bucket)` before
+the element loop. `IS_FAKE_ELEM_COUNT` only requires `N <= remaining/2`, so the
+serialized value needs `~2*N` bytes of filler that are never parsed (the bailout
+fires at `real_init` first). `fpm/payload/sess_A_amp128` is a session record
+`p|a:2500000:{` + filler, **4.77 MB** on disk; `next_pow2(2500000)=2^22` forces
+a ~134 MB bucket allocation. Amplification ~28x; input floor is `N=2097153`
+(~4.2 MB, the smallest `N` reaching the `2^22` bucket count). **Inference:** a
+gzip/base64 transport would raise the ratio further, but the groom reads from
+disk, so wire size is moot (see prop 2).
+
+Observed (`fpm/probe-stock-oom.gdb`, stock 128M, no `ini_set`): `session_start()`
+on the 4.77 MB record bails inside the decode:
+
+```
+#0  _zend_bailout
+#2  zend_error_zstr_at
+#4  zend_error_noreturn
+#7  zend_hash_real_init_mixed
+#9  php_var_unserialize
+#13 php_session_start
+==> BGscan: data@bg+0x368 == 0x7ffff6290000 (==d), next dword(level)=1
+```
+
+`php_var_unserialize_destroy` never fires; `BG(unserialize).level` stays 1 and
+`.data` dangles at `d`, exactly as §1. The 8.5.12 fix makes this allocation
+*fallible* (`array_finit_size_mixed` returns FAILURE instead of longjmp), which
+is what closes the bailout window; on 8.5.11 the allocation bails. Confirmed on
+the plain (non-gdb) worker: with the 5 MB file verified present, request A
+returns 500 with no `STARTED`, and FPM keeps the worker.
+
+### Reuse still occurs at 128M (A/B pair)
+
+The dangling state is memory-limit-independent. A's RSHUTDOWN `memset` of
+`BG(unserialize)` (`ext/standard/basic_functions.c:499`) is skipped on the
+bailout, and B's upload-progress decode runs in `php_hash_environment()` before
+Basic's RINIT `memset` (`:395`). Traced A (stock amp file) + B (multipart
+upload-progress, `fpm/fcgi_split.py`) at stock 128M:
+
+```
+A: init -> d=0x7ffff6290000  level=1   [FRESH];  BAILOUT level=1 data=d
+B: init enter  BG.data=0x7ffff6290000 level=1  ->  d=0x7ffff6290000 level=2  [REUSE]
+```
+
+B's pre-RINIT `php_var_unserialize_init()` takes the reuse branch and returns
+A's freed `d`. **A plain GET that calls `session_start()` in the script does not
+reuse** (it runs after RINIT, which already zeroed the globals); the reuse is
+specific to the upload-progress pre-RINIT path.
+
+### Prop (3) groom/offsets: reclaim fires, 4M payload misaligns
+
+The freed-`d` region is reclaimed at 128M, but the `fillU.bin` content baked for
+the 4M layout (deterministic `d=0x7ffff63b9000` under `setarch -R`) does not land
+its forged header on the shifted 128M `d`. Reading `d[0:0x20]` at B's reuse:
+
+```
+4M   (works): d=0x7ffff6280000  last_dtor=0x7ffff63b9800   (== fillU.bin header)
+128M (stock): d=0x7ffff6290000  last=0x7ffff6004141  last_dtor=0x7ffff6293000
+```
+
+The 4.77 MB session read buffer shifts `d` by 0x10000 versus the 1.1 MB 4M file,
+and the reclaiming chunk lands misaligned (`0x4141` = raw `A` filler, not the
+forged `var_dtor_entries` pointer). So the write primitive does not arm and B
+crashes without the proof. This is the known "offsets tuned at 4M" limitation,
+not a new barrier: the native leak-driven chain (§9, `mk_native_fill.py`)
+rebuilds `fillU.bin` from the observed `d`, and the same rebuild would retune the
+128M layout. **Verdict: partial** (primitive intact, weaponization needs retune).
+
+### Prop (2): attacker-chosen session bytes need an app write primitive
+
+Not reachable on a bare default install. The only stock mechanism that writes a
+session file is `session.upload_progress`, whose entry is a fixed-shape array
+built in `ext/session/session.c:3306-3334`: `start_time`, `content_length`,
+`bytes_processed`, `done` (server-computed longs/bool) and a `files[]` array
+whose only attacker strings are `field_name` and the uploaded `name`. Those
+serialize as `s:len:"..."`; the attacker cannot emit a declared-huge-count array
+(`a:2500000:{`, the groom) or raw pointer records (`i:<addr>;`, the exploit
+session). `session.use_strict_mode=0` lets the attacker pick the session id but
+not the file content, and the upload-progress payload is itself bounded well
+under 128M by `post_max_size=8M` / `max_file_uploads=20`. Seeding either the
+groom or the forged `sess_T` therefore requires an app-side session-write
+primitive (an app storing attacker-chosen keys/values/serialized data in
+`$_SESSION`, or a file-write sink such as the lab's `www/fpm_sess_raw.php`).
+
+### Net
+
+On a stock 128M install the **engine bug is fully reachable without the 4M
+crutch**: input amplification alone drives the decode-time OOM, the bailout
+leaves the dangling context, and the upload-progress A/B pair reuses it. What a
+bare default install does **not** give the attacker is prop (2), getting chosen
+serialized bytes into a session file, and a matched groom (prop 3) for ASLR-off
+addresses. Both are application/target properties, not engine behavior, so the
+honest end-to-end verdict is unchanged from §8: the chain needs app-side session
+injection (and, on a real target, an address leak + retuned fill); the OOM-
+bailout and dangling-reuse halves of the primitive need neither the 4M `ini_set`
+nor any non-default ini.

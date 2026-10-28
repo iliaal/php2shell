@@ -28,6 +28,7 @@ detailed references.
 | B | mod_php 8.5.11, `display_errors=Off` | `php:8.5.11-apache` | stock `php.ini-production`, one persistent worker or pinned prefork | `/tmp/off_proof` | validated (3/3; re-run; 10-child 9-pin re-run) |
 | B2 | mod_php 8.5.11, pivot + `popen` ROP | same as B | same as B; `STAGE3=stage3_rop.php` | `/tmp/rop_proof` | validated on 10 pinned children |
 | C | PHP-FPM 8.5.11, native no-gdb | `php:8.5.11-fpm` | ASLR on, stock production ini, one worker (or 4 workers / 3 pins) | `/tmp/fpm5_proof` | validated (3/3; 5/5 multi; re-run) |
+| C2 | PHP-FPM 8.5.11, data-only `popen` ROP pivot (no forged `execute_data`) | `php:8.5.11-fpm` / `p2s-fpm-gdb:8511` | ASLR on, stock production ini, one worker; `bash fpm/run_rop_pivot.sh` | `/tmp/fpm_rop_proof` | validated (7/7; re-run). See `ROP_PIVOT.md` |
 | D | PHP-FPM 8.5.11, session-decode type confusion | `php:8.5.11-fpm` / `p2s-fpm-gdb:8511` | ASLR off (`setarch -R`), one worker | `/tmp/fpmx_proof` | **not reproducible from committed artifacts on a clean image; needs per-build re-derivation** (see note) |
 | E | path1 multipart partial bucket | `php:8.5.11-apache` | ASLR off, gdb writes the fake block | `/tmp/p1hash` | gdb-only (re-run) |
 | F | FPM auxiliary app/config RCEs | `php:8.5.11-fpm` | preloaded class or serialize-handler mismatch; application gadget | `/tmp/preproof*` | excluded from php2shell; 8.5.11 verified, 8.5.12 blocked (pre-RINIT) |
@@ -710,8 +711,9 @@ controlled `zif_system`/`popen`. The detailed rounds are in `progress.md`.
 | path2 `session.auto_start` | RINIT OOM after the session id is created, with upload progress off | `php_rinit_session_globals()` runs before every next request and clears `PS(id)`/`send_cookie`; the only pre-RINIT consumer in stock PHP is the upload-progress callback. At most a startup failure/DoS | blocked |
 | FPM no-gdb frame (pre-Round 37) | option 1: fill-resident destructor argument; option 2: write `HT` fields after `track_init`; option 3: bucket-val fields as an `execute_data` | option 1 is impossible (`pDestructor(&p->val)`); option 2 had no post-track-init `_Set` write; option 3's `num_args`/`arg0`/type are engine-derived (`u2.extra` = `0xffffffff`). The E1 six-value layout also died in the encoder (7/8 buckets vs 5). Resolved by the E0/E2 layout in Round 37 | historical; resolved |
 | FPM PS-zval fake reference | overwrite `PS(http_session_vars)` with a fake reference in the pre-RINIT callback | at the next `track_init` the zval is `IS_UNDEF`; the startup-failure path exits the worker. The stale A reference is never destroyed | blocked |
-| FPM ROP pivot | use `jump_fcontext` as `pDestructor` with a `popen` ROP stack | the upload-progress insert writes bucket 0 (the MXCSR qword) before the destroy; `ldmxcsr` #GPs at `jump_fcontext+8`. No `mov rsp,[rdi+imm]; ret` / `lea rsp,[rdi+imm]; ret` gadget in the binary | blocked |
-| FPM in-band table ROP | build the fake table through the session decode, then the progress insert | the insert overwrites bucket 0; the same `ldmxcsr` failure. The `zif_system` frame tolerates the write because its opline is unused; the pivot cannot | blocked |
+| FPM ROP pivot via teardown destroy | use `jump_fcontext` as `pDestructor`, fired by the array teardown | the upload-progress insert writes bucket 0 (the MXCSR qword) before the destroy; `ldmxcsr` #GPs at `jump_fcontext+8`. No `mov rsp,[rdi+imm]; ret` / `lea rsp,[rdi+imm]; ret` gadget in the binary | blocked (this fire point only) |
+| FPM in-band table ROP via teardown | build the fake table through the session decode, fire via the teardown | the insert overwrites bucket 0; the same `ldmxcsr` failure. The `zif_system` frame tolerates the write because its opline is unused; the pivot cannot | blocked (this fire point only) |
+| FPM data-only ROP pivot (Path C2) | same pivot, fired by the upload-progress `zend_hash_update` old-value destructor on a forged `upload_progress_x` key at bucket 0 | **resolved**: the old-value destructor runs on the clean bucket 0 before the clobbering copy, so the pivot sees an intact buffer. `uid=33`, 7/7, ASLR on, no gdb. See `ROP_PIVOT.md` and Path C2 | **working** |
 | FPM script-path pivot | `session_start()` in the script, then `$_SESSION['x'] = 0x0000037F00001F80` | `PHP_RINIT_FUNCTION(basic)` zeroes `BG(unserialize)` before the script; the B allocates a fresh `d`. Only the pre-RINIT upload-progress callback reuses the stale `d` | blocked |
 | FPM cookie-off SID | `session.use_cookies=0`, `session.use_trans_sid=1`; use the `SID` output as the leak sink | the SID sink is reachable, but `PS(id)` length is `0x1D010` from the upload-progress write target. The A `pre`/`pad`/`hole`, query padding, and `sess_A` size do not move it; stop the blind sweep | blocked |
 | FPM `php_serialize` variant | decode the stale `d` with `session.serialize_handler=php_serialize` | the decoder unserializes the whole record and assigns it to `PS(http_session_vars)`; it does not call `php_set_session_var` and has no per-value `tmp_var`. No `SET#`; the `v5` stays normal | blocked |
@@ -823,6 +825,8 @@ pre-RINIT session-object decode keeps objects as `__PHP_Incomplete_Class`.
 | `off_chain/keepalive_relay.py` | Research relay; not part of the chain. |
 | `fpm/run_native.sh` | Path C leak + exploit pairs, fill rebuild, proof. |
 | `fpm/mk_native_fill.py` | Rebuilds the fill for a leaked `d`; `--e0`, `--nogdb`, `--heap`. |
+| `fpm/run_rop_pivot.sh` | Path C2 data-only ROP pivot chain (isolated FPM + nginx). |
+| `fpm/mk_rop_pivot.py` | Overlays the pivot buffer + forged progress-key lookup onto the Round 37 nogdb fill. |
 | `fpm/fcgi_split.py` | FastCGI split sender; `PROG`, `SID_GET`. |
 | `fpm/pin_fcgi.py` | Pins FPM workers with truncated FastCGI records. |
 | `fpm/zz-single.conf` | One FPM worker. |
@@ -860,12 +864,13 @@ inherit them.
 | B | x86-64 | `CONTAINER=p2s-8511-off ./off_chain/run_off_chain.sh 8091 /tmp/off_proof` | `RCE OK`; `uid=33(www-data)`; live date |
 | B2 (ROP) | x86-64 | `STAGE3=stage3_rop.php CONTAINER=p2s-10ka PINS=9 ./off_chain/run_off_chain_pinned.sh 8093 /tmp/rop_proof` | `RCE OK`; `uid=33(www-data)`; live date |
 | C | x86-64 | `MODE=nogdb IMAGE=php:8.5.11-fpm SESS_MODE=nogdb bash fpm/run_native.sh` | `[proof] uid=33(www-data)` |
+| C2 (data-only ROP) | x86-64 | `bash fpm/run_rop_pivot.sh` | `/tmp/fpm_rop_proof` = `uid=33(www-data)`, **7/7**, ASLR on, no gdb |
 | D | x86-64 | `MODE=nogdb bash fpm/run_rce_fpm.sh` | **FAIL**: worker SIGSEGV, no proof (see Path D caveat; fill reclaims `d`) |
 | E | x86-64 | `bash path1_hash/run_path1.sh 8093 /tmp/p1.bin` (setarch -R gdb target) | `/tmp/p1hash` = `uid=33(www-data)` |
 | Barm | aarch64 | `CONTAINER=p2s-8511-off ./off_chain/run_off_chain_arm.sh 8091 /tmp/off_proof` | `uid=33(www-data)`, **4/5** fresh-worker runs across randomized ASLR bases |
 | Carm | aarch64 | `MODE=nogdb IMAGE=php:8.5.11-fpm SESS_MODE=nogdb bash fpm/run_native_arm.sh` | `[proof] uid=33(www-data)`, **3/3** |
 
-A/B/B2/C/E reproduce cleanly on x86-64; Path B ports to aarch64 (Path B's small-
+A/B/B2/C/C2/E reproduce cleanly on x86-64; Path B ports to aarch64 (Path B's small-
 bin spray and the B1 leak are architecture-portable, see `PORTING.md`). Path D
 does not reproduce as shipped (fixed-address FPM groom is build-specific). The
 aarch64 miss (1/5) is `parse_leak_arm.php` failing to locate a cluster, a leak-

