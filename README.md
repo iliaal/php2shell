@@ -47,6 +47,7 @@ is the runnable proof.
 | B | mod_php | same chain, stock `php.ini-production`, pure HTTP |
 | B2 | mod_php | Path B with a `popen` ROP stack |
 | C | php-fpm | session-decode reuse, app-visible leak, ASLR on |
+| C2 | php-fpm | Path C fired through a `popen` ROP pivot, no forged `execute_data` |
 | E | mod_php | multipart partial-bucket teardown (debugger-assisted) |
 
 aarch64 ports: `off_chain/run_off_chain_arm.sh` (mod_php, Path B) and
