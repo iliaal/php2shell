@@ -54,11 +54,11 @@ aarch64 ports: `off_chain/run_off_chain_arm.sh` (mod_php, Path B) and
 
 ## Layout
 
-- `chain.php`, `off_chain/` — mod_php chains (Paths A, B, B2)
-- `fpm/` — PHP-FPM chains (Path C and the native leak harness)
-- `path1_hash/`, `path1_rce/` — Path E (multipart partial bucket)
-- `lab/` — Apache and `php.ini` configs for the lab targets
-- `www/` — the two-page lab application; run `composer install` in `www/` for
+- `chain.php`, `off_chain/`: mod_php chains (Paths A, B, B2)
+- `fpm/`: PHP-FPM chains (Path C and the native leak harness)
+- `path1_hash/`, `path1_rce/`: Path E (multipart partial bucket)
+- `lab/`: Apache and `php.ini` configs for the lab targets
+- `www/`: the two-page lab application; run `composer install` in `www/` for
   the Path F auxiliary scenarios
 
 ## Fix
