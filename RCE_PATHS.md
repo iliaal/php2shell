@@ -401,6 +401,67 @@ the incomplete-class mode.
 - The FPM worker exits on a startup failure; the trigger must fail after
   request startup succeeded.
 
+### Delivery over HTTP through a stock nginx (no direct fpm access)
+
+The earlier Path C runners (`run_native.sh`, `fcgi_split.py`) send the leak and
+the write as raw FastCGI to a host-published fpm port, and `nginx.conf` carries
+`fastcgi_request_buffering off`. Both are lab conveniences, not requirements.
+The full chain delivers end-to-end over plain HTTP through a stock-default nginx
+reverse proxy with php-fpm **not reachable by the client**:
+
+```bash
+bash fpm/run_http_full.sh      # proof: /tmp/fpm5_proof = uid=33(www-data)
+```
+
+`run_http_full.sh` is self-contained: it creates a fresh fpm container with **no
+published port** (alias `p2s-fpm-http`, reachable only by the co-located nginx
+over the docker network) and a stock nginx on `127.0.0.1:9005`. The exploit
+client only ever talks to nginx; host connections to fpm `:9000`/`:9003` are
+refused. The leak (heap+PIE) and the controlled write both ride HTTP POSTs
+proxied to fpm by nginx.
+
+Adaptations versus the direct-fpm chain, and nothing else:
+
+- **Leak groom moves into the POST body.** The direct leak grooms with a ~49 KB
+  query string; a default nginx `414`s a request line over ~8 KB. Relocating the
+  12 groom vars into the multipart body (`QS_IN_BODY=1` in `http_deliver.py`,
+  reflected via `post.php`/`$_POST`) keeps the request under nginx limits. The
+  length-corruption over-read fires identically; the leaked PIE sits at over-read
+  offset `0x3008`, the heap pointer at `0x98`.
+- **One-slot reclaim shift.** The POST-parse allocation order moves the reclaim
+  by one slot, so `d = heap + 0x193c10` (`DCONST`, `+0x38` over the GET-layout
+  `0x193bd8`). Stable across fresh ASLR (leaked heap low-12 `0x3f0` every run),
+  no per-run tuning.
+- **nginx runs stock defaults**, except `client_max_body_size 16m` for the
+  ~1.19 MB write body (any deployment using `PHP_SESSION_UPLOAD_PROGRESS` uploads
+  already raises this). `fastcgi_request_buffering`, `large_client_header_buffers`
+  and `client_header_buffer_size` are all left at nginx defaults.
+
+`fastcgi_request_buffering` is proven **irrelevant** to this chain: on or off,
+the same `uid=33`. It governs request-body streaming to fpm, but the exploit's
+body is a complete POST with a matching `Content-Length` (no truncation), and
+the only request that could be affected still lands the shell either way.
+
+**Reliability:** roughly 6 in 10 fresh workers (12 of 19 across repeated
+samples; 7 of 12 in the largest single run), across randomized ASLR. Every miss
+is a clean leak-stage failure (no proof written, no partial state), so the
+attack is retried, not stuck. The leak over-read needs a reasonably pristine
+heap, so the runner recreates the fpm container each invocation; re-run on a
+miss.
+
+**Same caveat as Path C:** the session records (`sess_A` priming array,
+`sess_LB`, exploit `EB`) are still seeded onto the container `/tmp` via
+`docker cp`, exactly as the direct chain does. In a real attack those come from
+prior `session_start()`/session-write HTTP requests; that seeding step is
+orthogonal to the transport and is not exercised here. What this run settles is
+narrow and real: the leak and write **primitives** are HTTP-deliverable through a
+realistic nginx+fpm front end, so direct fpm access was never load-bearing.
+
+Artifacts: `fpm/run_http_full.sh` (full chain), `fpm/http_deliver.py` (fcgi_split
+body/query bytes over HTTP, `QS_IN_BODY` groom relocation), `fpm/nginx-default.conf`
+(stock front end), `fpm/leak_probe.sh` and `fpm/run_http_phase1.sh` (leak-transport
+and write-isolation checks). Status: **validated**.
+
 ---
 
 ## Path D — PHP-FPM 8.5.11, session-decode type confusion (`setarch -R`)
