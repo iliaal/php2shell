@@ -19,9 +19,10 @@ vulnerability, CVE-2026-109618 and CVE-2026-109619, fixed in PHP 8.5.12 /
 
 End-to-end chains that turn a single unauthenticated HTTP request into
 `uid=33(www-data)` on an unpatched PHP, across both execution models (Apache
-mod_php and PHP-FPM) and both architectures (x86-64 and aarch64). The companion
-write-up explains the root cause and why reliable exploitation is hard; this
-repository is the runnable proof.
+mod_php and PHP-FPM) and both architectures (x86-64 and aarch64). The
+[companion write-up](https://ilia.ws/blog/php2shell-two-ways-php-corrupts-its-own-memory)
+explains the root cause and why reliable exploitation is hard; this repository
+is the runnable proof.
 
 ## Prerequisites
 
@@ -66,5 +67,6 @@ Upgrade. 8.5.12 / 8.4.27 / 8.3.36 / 8.2.35 remove both CVEs. On an end-of-life
 branch, do not hand-apply an isolated source patch on top of the last EOL
 release: it closes these two CVEs but leaves you exposed to everything else
 fixed since the branch went out of support. Get a maintained build from your
-distro or a package maintainer, or upgrade. See the companion write-up for the
-full mitigation list.
+distro or a package maintainer, or upgrade. See the
+[companion write-up](https://ilia.ws/blog/php2shell-two-ways-php-corrupts-its-own-memory)
+for the full mitigation list.
