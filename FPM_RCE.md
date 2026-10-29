@@ -256,6 +256,17 @@ progress-clobbered bucket 0 and so cannot carry the pivot), it forges the
 before the insert overwrites it. `bash fpm/run_rop_pivot.sh` → `uid=33`, 7/7,
 ASLR on, no gdb.
 
+The data-only variant also lands on a multi-worker pool: `bash
+fpm/run_rop_pivot_multi.sh` drives a `pm.max_children=4` pool, pinning 3 of the
+4 workers (`fpm/pin_fcgi.py`) so the groom A and exploit B share the one free
+worker, and reports **6/6 `uid=33`, ASLR on, no gdb**. Same single-shot-per-
+worker constraint as the single-worker runner (§7), so the runner recreates the
+pool per run; the affinity and reliability analysis, and the re-confirmed
+teardown block, are in `ROP_PIVOT.md` §"Multi-worker reliability" and §"The
+teardown-destroy obstacle". This makes the §8 genericity note ("otherwise spray
+B requests or pin the upstream connection") concrete: pinning is the mechanism,
+and it is reliable.
+
 ## 11. Stock-config reachability (128M)
 
 Verdict per genericity prop, on `php:8.5.11-fpm` with stock `php.ini-production`

