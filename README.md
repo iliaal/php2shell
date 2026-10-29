@@ -62,6 +62,9 @@ aarch64 ports: `off_chain/run_off_chain_arm.sh` (mod_php, Path B) and
 
 ## Fix
 
-Upgrade. 8.5.12 / 8.4.27 / 8.3.36 / 8.2.35 remove both CVEs. Older branches have
-source backports (7.4, 8.0, 8.1) and distro or maintainer builds. See the
-companion write-up for the full mitigation list.
+Upgrade. 8.5.12 / 8.4.27 / 8.3.36 / 8.2.35 remove both CVEs. On an end-of-life
+branch, do not hand-apply an isolated source patch on top of the last EOL
+release: it closes these two CVEs but leaves you exposed to everything else
+fixed since the branch went out of support. Get a maintained build from your
+distro or a package maintainer, or upgrade. See the companion write-up for the
+full mitigation list.
