@@ -27,7 +27,7 @@ detailed references.
 | A | mod_php 8.5.11, `display_errors=On` | `php:8.5.11-apache` | `display_errors=On`, `output_buffering=0`, one persistent worker | `out/p1` | validated (6/6; re-run) |
 | B | mod_php 8.5.11, `display_errors=Off` | `php:8.5.11-apache` | stock `php.ini-production`, one persistent worker or pinned prefork | `/tmp/off_proof` | validated (3/3; re-run; 10-child 9-pin re-run) |
 | B2 | mod_php 8.5.11, pivot + `popen` ROP | same as B | same as B; `STAGE3=stage3_rop.php` | `/tmp/rop_proof` | validated on 10 pinned children |
-| C | PHP-FPM 8.5.11, native no-gdb | `php:8.5.11-fpm` | ASLR on, stock production ini, one worker (or 4 workers / 3 pins) | `/tmp/fpm5_proof` | validated (3/3; 5/5 multi; re-run) |
+| C | PHP-FPM 8.5.11, native no-gdb | `php:8.5.11-fpm` | ASLR on, stock production ini, one worker, 4 workers / 3 pins, or broadcast over the rotation (no pins) | `/tmp/fpm5_proof` | validated (3/3; 5/5 multi; broadcast 15/15 pools 2/4/8; re-run) |
 | C2 | PHP-FPM 8.5.11, data-only `popen` ROP pivot (no forged `execute_data`) | `php:8.5.11-fpm` / `p2s-fpm-gdb:8511` | ASLR on, stock production ini, one worker; `bash fpm/run_rop_pivot.sh` | `/tmp/fpm_rop_proof` | validated (7/7; re-run). See `ROP_PIVOT.md` |
 | D | PHP-FPM 8.5.11, session-decode type confusion | `php:8.5.11-fpm` / `p2s-fpm-gdb:8511` | ASLR off (`setarch -R`), one worker | `/tmp/fpmx_proof` | **not reproducible from committed artifacts on a clean image; needs per-build re-derivation** (see note) |
 | E | path1 multipart partial bucket | `php:8.5.11-apache` | ASLR off, gdb writes the fake block | `/tmp/p1hash` | gdb-only (re-run) |
@@ -356,8 +356,9 @@ POOL_CONF=zz-multi.conf PINS=3 PRE=25500 MAX_CHILDREN=4 \
 
 `pin_fcgi.py` holds three workers with truncated FastCGI STDIN records; the
 free worker serves the leak and exploit pairs. `PRE=25500` matches the free
-worker's leak layout. The same proof is expected. Without the pins, a stock
-multi-worker pool has no affinity and the chain is probabilistic.
+worker's leak layout. The same proof is expected. The pins are not the only way
+to satisfy the same-worker rule in a pool: see "Multi-worker without pinning"
+below, where the chain broadcasts across the stock nginx rotation instead.
 
 ### Mechanism
 
@@ -461,6 +462,55 @@ Artifacts: `fpm/run_http_full.sh` (full chain), `fpm/http_deliver.py` (fcgi_spli
 body/query bytes over HTTP, `QS_IN_BODY` groom relocation), `fpm/nginx-default.conf`
 (stock front end), `fpm/leak_probe.sh` and `fpm/run_http_phase1.sh` (leak-transport
 and write-isolation checks). Status: **validated**.
+
+### Multi-worker without pinning (broadcast over the rotation)
+
+The pins are a lab convenience, not a requirement, for landing the chain in a
+pool. Behind a stock-default nginx the client opens a new upstream connection per
+request; the fpm workers all block in `accept()` on one shared listen socket, and
+Linux wake-one hands each new connection to the next waiter, so on an idle pool
+they answer in a strict round robin. The attacker uses the rotation instead of
+fighting it and addresses every worker in turn:
+
+```bash
+bash fpm/run_http_broadcast.sh         # pool 4 (default)
+POOL=2 bash fpm/run_http_broadcast.sh
+POOL=8 bash fpm/run_http_broadcast.sh
+```
+
+Cycle for `N = pm.max_children`: prime `A`xN (OOM, one per worker), leak `B`xN
+(read the i-th leak out of the i-th response), build the fill from any valid
+leak, prime `A`xN again, then fire `B`x up to 2N (the i-th fire hits the i-th
+leak worker; the extra N covers a rotation slip). Each worker's per-stage history
+is identical to the single-worker chain, so the primitives apply unchanged. The
+cost is `2N` ordinary complete requests per cycle, no slow bodies and nothing
+held open, against holding `N-1` connections half-sent for the pin. The proof
+lands on the leak worker; no `/index.php` line appears in the fpm access log
+because the fire `SIGSEGV`s the worker before request-end logging.
+
+Measured: `uid=33(www-data)` on pools of 2, 4, and 8, stock nginx, fpm not
+host-exposed, no pinning (15/15 across runs).
+
+Caveats:
+
+- Idle pool only. Background traffic perturbs the rotation and the index
+  pairing; the under-load rate is unmeasured.
+- Cold opcache layout, as the single-worker and pinned runs. Only the worker that
+  first compiles the scripts matches `PRE=25500`; a warm pool needs its own
+  `PRE`/`DCONST`.
+- `pm = static`. `dynamic`, `ondemand`, and `SO_REUSEPORT` front ends can change
+  the wake order; re-measure before generalizing.
+- Seeded sessions, same as Path C above.
+
+FastCGI keep-alive is the other way to get affinity: one kept nginx-to-fpm
+connection pins one worker (`fastcgi_keep_conn on` plus `upstream { ... keepalive
+N; }`). Confirmed with the PID probe but not run end-to-end through the chain, and
+it is a performance setting, not the nginx default. The rotation broadcast needs
+no such config.
+
+Artifacts: `fpm/run_http_broadcast.sh` (broadcast chain), `fpm/nginx-bc-stock.conf`
+(stock front end), `fpm/affinity_probe.py` and `fpm/run_affinity.sh` (per-request
+worker-PID mapping, stock versus keep-alive front ends). Status: **validated**.
 
 ---
 

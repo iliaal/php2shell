@@ -24,7 +24,9 @@ mod_php and PHP-FPM) and both architectures (x86-64 and aarch64). The
 explains the root cause and why reliable exploitation is hard; this repository
 is the runnable proof. The FPM chains run end to end over a stock-default nginx
 reverse proxy with php-fpm unexposed (`fpm/run_http_full.sh`), not just direct
-FastCGI; see `RCE_PATHS.md` Path C.
+FastCGI; see `RCE_PATHS.md` Path C. In a multi-worker pool the chain lands
+without slow-body pinning by broadcasting across the stock nginx worker rotation
+(`fpm/run_http_broadcast.sh`).
 
 ## Prerequisites
 
