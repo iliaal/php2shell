@@ -983,6 +983,32 @@ image. The x86-64 -> aarch64 port and the re-derivation procedure are in
 - Do not expose FPM directly; the FastCGI `PHP_VALUE`/`PHP_ADMIN_VALUE` params
   are a separate hardening issue.
 
+### Defense-in-depth checks (verified 2026-10-29)
+
+These limit what a successful corruption can do; none fix the bug.
+
+- **Removing the shell defeats the `system()` payload.** The exploit sets the
+  destructor to the internal `zif_system` and calls it by address, so its final
+  step is the same `execve("/bin/sh")` that userland `system()` takes. Deleting
+  the shells (`/bin/sh`, `/bin/dash`, `/bin/bash`) from the FPM container turned
+  `system('id')` from `uid=33(www-data)` into `RET=false EXIT=-1`, so the
+  corruption's command dies too. A tailored AppArmor/SELinux profile that denies
+  the worker `execve` of a shell, or a shell-less/distroless image, is the same
+  control. Note the default Docker seccomp/AppArmor profiles do NOT block shell
+  exec, and seccomp cannot cleanly deny `execve` (the entrypoint needs it, and it
+  filters syscall numbers, not the path), so this is an AppArmor / shell-removal
+  control, not a seccomp one.
+- **`disable_functions` is bypassed.** The call reaches `zif_system` by address,
+  so the engine's dispatch-time `disable_functions` check never runs. With
+  `php_admin_value[disable_functions] = system,exec,shell_exec,passthru,popen,proc_open,...`
+  on the pool (worker confirmed `system_callable=false`), the HTTP chain still
+  returned `uid=33` on the first try.
+- **Code execution still exfiltrates without a shell.** The same primitive reaches
+  any internal handler, so with the shells removed AND `disable_functions` set, a
+  `readfile('/var/www/html/.env')` returned the file in the HTTP response
+  (`DB_PASSWORD`, `APP_KEY`, `STRIPE_SECRET` in the test). Sandboxing raises the
+  bar; it does not stop secret theft through PHP. Only the upgrade removes the bug.
+
 ## Safety
 
 Lab only. The vulnerable images are PHP 8.5.11; the fixed controls are 8.5.12.
